@@ -3,6 +3,7 @@
 use eframe::egui;
 use std::fs::File;
 use std::io::BufReader;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const DEFAULT_ROOT: &str = r"D:\ppsync\music\_packs";
@@ -15,6 +16,11 @@ struct Entry {
 }
 
 struct App {
+    root: PathBuf,
+    /// Lazily loaded subfolders per folder, for the tree.
+    tree_children: HashMap<PathBuf, Vec<(String, PathBuf)>>,
+    expanded: HashSet<PathBuf>,
+    tree_scroll_to_cwd: bool,
     cwd: PathBuf,
     entries: Vec<Entry>,
     filter: String,
@@ -45,6 +51,10 @@ impl App {
             Err(e) => (None, None, Some(format!("Audio device error: {e}"))),
         };
         let mut app = Self {
+            root: root.clone(),
+            tree_children: HashMap::new(),
+            expanded: HashSet::new(),
+            tree_scroll_to_cwd: false,
             cwd: root.clone(),
             entries: vec![],
             filter: String::new(),
@@ -83,6 +93,12 @@ impl App {
         entries.sort_by(|a, b| {
             b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+        // Expand the tree down to the new folder.
+        for a in dir.ancestors().skip(1) {
+            self.expanded.insert(a.to_path_buf());
+            if a == self.root { break; }
+        }
+        self.tree_scroll_to_cwd = true;
         let came_from = std::mem::replace(&mut self.cwd, dir);
         self.entries = entries;
         self.filter.clear();
@@ -150,6 +166,59 @@ impl App {
         }
     }
 
+    fn subdirs(&mut self, dir: &Path) -> Vec<(String, PathBuf)> {
+        self.tree_children
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                let mut v: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+                    .map(|rd| {
+                        rd.flatten()
+                            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                v.sort_by_key(|(n, _)| n.to_lowercase());
+                v
+            })
+            .clone()
+    }
+
+    fn tree_node(&mut self, ui: &mut egui::Ui, name: &str, path: PathBuf, nav: &mut Option<PathBuf>) {
+        let children = self.subdirs(&path);
+        let open = self.expanded.contains(&path);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if children.is_empty() {
+                ui.add_space(ui.spacing().interact_size.y);
+            } else if ui
+                .add(egui::Button::new(if open { "⏷" } else { "⏵" }).frame(false).min_size(egui::vec2(ui.spacing().interact_size.y, 0.0)))
+                .clicked()
+            {
+                if open { self.expanded.remove(&path); } else { self.expanded.insert(path.clone()); }
+            }
+            let is_cwd = path == self.cwd;
+            let r = ui.add(egui::Button::selectable(is_cwd, (format!("📁 {name}"), egui::Atom::grow()))
+                .frame_when_inactive(false)
+                .min_size(egui::vec2(ui.available_width(), 0.0)));
+            if is_cwd && self.tree_scroll_to_cwd {
+                r.scroll_to_me(None);
+                self.tree_scroll_to_cwd = false;
+            }
+            if r.clicked() { *nav = Some(path.clone()); }
+            if r.double_clicked() && !children.is_empty() {
+                if open { self.expanded.remove(&path); } else { self.expanded.insert(path.clone()); }
+            }
+        });
+        if open && !children.is_empty() {
+            ui.indent(&path, |ui| {
+                for (n, p) in children {
+                    self.tree_node(ui, &n, p, nav);
+                }
+            });
+        }
+    }
+
     fn go_up(&mut self) {
         if let Some(parent) = self.cwd.parent() {
             self.navigate(parent.to_path_buf());
@@ -206,7 +275,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = &root_ui.ctx().clone();
         self.handle_keys(ctx);
 
@@ -218,6 +287,7 @@ impl eframe::App for App {
                 }
                 if ui.button("📁").on_hover_text("Open folder…").clicked() {
                     if let Some(d) = rfd::FileDialog::new().set_directory(&self.cwd).pick_folder() {
+                        self.root = d.clone();
                         self.navigate(d);
                     }
                 }
@@ -262,10 +332,21 @@ impl eframe::App for App {
             });
         });
 
+        egui::Panel::left("tree").resizable(true).default_size(260.0).show(root_ui, |ui| {
+            let mut nav = None;
+            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                let root = self.root.clone();
+                let name = root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
+                self.tree_node(ui, &name, root, &mut nav);
+            });
+            if let Some(p) = nav { self.navigate(p); }
+        });
+
         egui::CentralPanel::default().show(root_ui, |ui| {
             let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
             let mut clicked = None;
             let mut dbl = None;
+            let mut drag_out = None;
             let scroll_target = self.scroll_to_selected.then_some(self.selected).flatten();
             self.scroll_to_selected = false;
             let mut area = egui::ScrollArea::vertical().auto_shrink(false);
@@ -281,11 +362,14 @@ impl eframe::App for App {
                 for vi in range {
                     let e = &self.entries[self.visible[vi]];
                     let icon = if e.is_dir { "📁" } else if self.playing.as_deref() == Some(&e.path) { "🔊" } else { "🎵" };
-                    let r = ui.add_sized(
-                        [ui.available_width(), row_h],
-                        egui::Button::selectable(self.selected == Some(vi), format!("{icon}  {}", e.name))
-                            .frame_when_inactive(false),
+                    let r = ui.add(
+                        egui::Button::selectable(self.selected == Some(vi), (format!("{icon}  {}", e.name), egui::Atom::grow()))
+                            .frame_when_inactive(false)
+                            .truncate()
+                            .min_size(egui::vec2(ui.available_width(), row_h)),
                     );
+                    let r = r.interact(egui::Sense::click_and_drag());
+                    if r.drag_started() && !e.is_dir { drag_out = Some(e.path.clone()); }
                     if r.clicked() { clicked = Some(vi); }
                     if r.double_clicked() { dbl = Some(vi); }
                 }
@@ -295,6 +379,14 @@ impl eframe::App for App {
             if let Some(i) = clicked {
                 self.selected = Some(i);
                 if !self.entries[self.visible[i]].is_dir { self.select(i); }
+            }
+            if let Some(p) = drag_out {
+                // Hand the file to the OS so it can be dropped into FL Studio, Explorer, etc.
+                // Always Copy mode, so the sample is never moved out of the library.
+                let opts = drag::Options { mode: drag::DragMode::Copy, ..Default::default() };
+                if let Err(e) = drag::start_drag(frame, drag::DragItem::Files(vec![p]), drag::Image::Raw(vec![]), |_, _| {}, opts) {
+                    self.error = Some(format!("Drag failed: {e}"));
+                }
             }
             if let Some(i) = dbl {
                 self.selected = Some(i);
