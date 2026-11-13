@@ -1,3 +1,7 @@
+[env]
+# Make cargo available even if ~/.cargo/bin is not on PATH yet.
+_.path = ["{{env.USERPROFILE}}/.cargo/bin"]
+
 [tasks.dev]
 description = "Run splajs (debug build, optimized deps)"
 run = "cargo run"
