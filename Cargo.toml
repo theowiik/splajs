@@ -1,0 +1,17 @@
+[package]
+name = "splajs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37.0"
+rfd = "0.18.0"
+rodio = "0.23.0"
+
+# Optimize dependencies (audio decoding, rendering) even in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = true
+codegen-units = 1

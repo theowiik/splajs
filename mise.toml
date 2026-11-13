@@ -1,0 +1,7 @@
+[tasks.dev]
+description = "Run splajs (debug build, optimized deps)"
+run = "cargo run"
+
+[tasks.release]
+description = "Build optimized release exe"
+run = "cargo build --release"
